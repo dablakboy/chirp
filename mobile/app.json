@@ -1,25 +1,26 @@
 {
   "expo": {
-    "name": "vibecode",
+    "name": "Chirp",
     "slug": "vibecode",
-    "scheme": "vibecode",
+    "scheme": "chirp",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.vibecode.app",
+      "bundleIdentifier": "com.vibecode.chirp",
       "buildNumber": "1",
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "Vibecode needs access to your microphone to send voice messages.",
-        "NSLocationWhenInUseUsageDescription": "Vibecode uses your location to show nearby users.",
-        "NSCameraUsageDescription": "Vibecode may use your camera for future video features."
+        "NSMicrophoneUsageDescription": "Chirp needs access to your microphone to send voice messages.",
+        "NSLocationWhenInUseUsageDescription": "Chirp uses your location to show nearby users.",
+        "NSCameraUsageDescription": "Chirp may use your camera for future video features.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
       "edgeToEdgeEnabled": true,
-      "package": "com.vibecode.app",
+      "package": "com.melvinberry.chirp",
       "versionCode": 1,
       "permissions": [
         "android.permission.RECORD_AUDIO",
@@ -37,7 +38,7 @@
         "expo-build-properties",
         {
           "ios": {
-            "deploymentTarget": "13.4"
+            "deploymentTarget": "15.1"
           },
           "android": {
             "minSdkVersion": 24
@@ -47,6 +48,12 @@
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "e0055a49-bb27-4061-8c9c-6711e702ad8d"
+      }
     }
   }
 }

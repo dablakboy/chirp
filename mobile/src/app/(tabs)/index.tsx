@@ -58,6 +58,10 @@ interface User {
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
+  // TURN relay fallback — required for symmetric NAT (mobile networks, corporate WiFi)
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
 // ─── Images ───────────────────────────────────────────────────────────────────
@@ -90,10 +94,24 @@ function generateCallSign(): string {
 let chirpInSound: Audio.Sound | null = null;
 let chirpOutSound: Audio.Sound | null = null;
 
+async function configureAudioSession() {
+  try {
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: true,
+      playsInSilentModeIOS: true,
+      staysActiveInBackground: false,
+      playThroughEarpieceAndroid: false,
+      shouldDuckAndroid: false,
+    });
+  } catch (e) {
+    console.log('[Audio] Could not configure audio session:', e);
+  }
+}
+
 async function loadChirpSounds() {
   try {
     await Audio.setAudioModeAsync({
-      allowsRecordingIOS: false,
+      allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
       staysActiveInBackground: false,
       playThroughEarpieceAndroid: false,
@@ -251,6 +269,7 @@ export default function ChirpScreen() {
       setMyUsername(uname);
     }
     initUser();
+    configureAudioSession();
     loadChirpSounds();
   }, []);
 
@@ -259,7 +278,16 @@ export default function ChirpScreen() {
   const initLocalStream = useCallback(async () => {
     if (localStreamRef.current) return;
     try {
-      const stream = await mediaDevices.getUserMedia({ audio: true, video: false }) as MediaStream;
+      const stream = await mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 16000,
+        } as any,
+        video: false,
+      }) as MediaStream;
       // Start muted — PTT enables the track
       stream.getAudioTracks().forEach((t) => { t.enabled = false; });
       localStreamRef.current = stream;
@@ -270,7 +298,7 @@ export default function ChirpScreen() {
   }, []);
 
   const createPeerConnection = useCallback((remoteUserId: string): RTCPeerConnection => {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, iceCandidatePoolSize: 10 });
 
     localStreamRef.current?.getTracks().forEach((track) => {
       pc.addTrack(track, localStreamRef.current!);
@@ -288,10 +316,28 @@ export default function ChirpScreen() {
 
     (pc as any).addEventListener('track', (event: any) => {
       console.log('[WebRTC] Remote track received from', remoteUserId);
+      try {
+        Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+          staysActiveInBackground: false,
+          playThroughEarpieceAndroid: false,
+          shouldDuckAndroid: false,
+        });
+      } catch (e) {
+        console.log('[Audio] Could not re-assert audio session on track:', e);
+      }
     });
 
     (pc as any).addEventListener('connectionstatechange', () => {
-      console.log('[WebRTC] Connection state with', remoteUserId, ':', pc.connectionState);
+      const state = pc.connectionState;
+      console.log('[WebRTC] Connection state with', remoteUserId, ':', state);
+      if (state === 'failed') {
+        console.log('[WebRTC] Peer connection failed — closing and cleaning up');
+        pc.close();
+        peerConnectionsRef.current.delete(remoteUserId);
+        pendingCandidatesRef.current.delete(remoteUserId);
+      }
     });
 
     peerConnectionsRef.current.set(remoteUserId, pc);
