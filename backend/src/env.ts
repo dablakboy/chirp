@@ -8,6 +8,13 @@ const envSchema = z.object({
   // Server Configuration
   PORT: z.string().optional().default("3000"),
   NODE_ENV: z.string().optional(),
+  // TURN/ICE server configuration (static fallback)
+  TURN_URLS: z.string().optional(),
+  TURN_USERNAME: z.string().optional(),
+  TURN_CREDENTIAL: z.string().optional(),
+  // Metered.ca dynamic credentials (preferred)
+  METERED_API_KEY: z.string().optional(),
+  METERED_HOST: z.string().optional().default("digiwall.metered.live"),
 });
 
 /**
