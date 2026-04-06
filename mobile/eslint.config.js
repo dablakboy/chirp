@@ -6,6 +6,12 @@ const pluginQuery = require("@tanstack/eslint-plugin-query");
 module.exports = defineConfig([
   expoConfig,
   {
+    files: ["**/*.cjs"],
+    languageOptions: {
+      globals: { __dirname: "readonly", __filename: "readonly", require: "readonly", module: "writable", exports: "writable", process: "readonly" },
+    },
+  },
+  {
     ignores: [
       "**/dist/**",
       "**/backend/generated/**",

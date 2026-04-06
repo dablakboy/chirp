@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -6,15 +6,10 @@ import {
   StyleSheet,
   Platform,
   Linking,
+  Animated,
+  Easing,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import Animated, {
-  useAnimatedStyle,
-  useSharedValue,
-  withTiming,
-  withDelay,
-  Easing,
-} from 'react-native-reanimated';
 import { Mic, MapPin } from 'lucide-react-native';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -57,25 +52,26 @@ function PermissionItem({
   denied,
   index,
 }: PermissionItemProps) {
-  const translateY = useSharedValue(40);
-  const opacity = useSharedValue(0);
+  const translateY = useRef(new Animated.Value(Platform.OS === 'web' ? 0 : 40));
+  const opacity = useRef(new Animated.Value(Platform.OS === 'web' ? 1 : 0));
 
   useEffect(() => {
-    const delay = 400 + index * 120;
-    translateY.value = withDelay(
-      delay,
-      withTiming(0, { duration: 500, easing: Easing.out(Easing.cubic) })
-    );
-    opacity.value = withDelay(
-      delay,
-      withTiming(1, { duration: 500, easing: Easing.out(Easing.cubic) })
-    );
+    if (Platform.OS !== 'web') {
+      const delay = 400 + index * 120;
+      Animated.sequence([
+        Animated.delay(delay),
+        Animated.parallel([
+          Animated.timing(translateY.current, { toValue: 0, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+          Animated.timing(opacity.current, { toValue: 1, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        ]),
+      ]).start();
+    }
   }, []);
 
-  const animStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
-    opacity: opacity.value,
-  }));
+  const animStyle = {
+    transform: [{ translateY: translateY.current }],
+    opacity: opacity.current,
+  };
 
   const statusColor = granted ? '#22c55e' : denied ? '#ef4444' : GRAY;
   const statusText = granted ? 'GRANTED' : denied ? 'DENIED' : 'REQUIRED';
@@ -106,60 +102,54 @@ export default function PermissionScreen({
   requesting,
   onAuthorize,
 }: PermissionScreenProps) {
-  const titleOpacity = useSharedValue(0);
-  const titleTranslateY = useSharedValue(-20);
-  const subtitleOpacity = useSharedValue(0);
-  const cardOpacity = useSharedValue(0);
-  const cardTranslateY = useSharedValue(30);
-  const btnOpacity = useSharedValue(0);
-  const btnTranslateY = useSharedValue(20);
+  const titleOpacity = useRef(new Animated.Value(Platform.OS === 'web' ? 1 : 0));
+  const titleTranslateY = useRef(new Animated.Value(Platform.OS === 'web' ? 0 : -20));
+  const subtitleOpacity = useRef(new Animated.Value(Platform.OS === 'web' ? 1 : 0));
+  const cardOpacity = useRef(new Animated.Value(Platform.OS === 'web' ? 1 : 0));
+  const cardTranslateY = useRef(new Animated.Value(Platform.OS === 'web' ? 0 : 30));
+  const btnOpacity = useRef(new Animated.Value(Platform.OS === 'web' ? 1 : 0));
+  const btnTranslateY = useRef(new Animated.Value(Platform.OS === 'web' ? 0 : 20));
 
   useEffect(() => {
-    titleOpacity.value = withTiming(1, { duration: 600, easing: Easing.out(Easing.cubic) });
-    titleTranslateY.value = withTiming(0, { duration: 600, easing: Easing.out(Easing.cubic) });
-
-    subtitleOpacity.value = withDelay(
-      200,
-      withTiming(1, { duration: 500, easing: Easing.out(Easing.cubic) })
-    );
-
-    cardOpacity.value = withDelay(
-      300,
-      withTiming(1, { duration: 500, easing: Easing.out(Easing.cubic) })
-    );
-    cardTranslateY.value = withDelay(
-      300,
-      withTiming(0, { duration: 500, easing: Easing.out(Easing.cubic) })
-    );
-
-    btnOpacity.value = withDelay(
-      700,
-      withTiming(1, { duration: 400, easing: Easing.out(Easing.cubic) })
-    );
-    btnTranslateY.value = withDelay(
-      700,
-      withTiming(0, { duration: 400, easing: Easing.out(Easing.cubic) })
-    );
+    if (Platform.OS !== 'web') {
+      Animated.parallel([
+        Animated.timing(titleOpacity.current, { toValue: 1, duration: 600, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        Animated.timing(titleTranslateY.current, { toValue: 0, duration: 600, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        Animated.sequence([
+          Animated.delay(200),
+          Animated.timing(subtitleOpacity.current, { toValue: 1, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        ]),
+        Animated.sequence([
+          Animated.delay(300),
+          Animated.parallel([
+            Animated.timing(cardOpacity.current, { toValue: 1, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+            Animated.timing(cardTranslateY.current, { toValue: 0, duration: 500, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+          ]),
+        ]),
+        Animated.sequence([
+          Animated.delay(700),
+          Animated.parallel([
+            Animated.timing(btnOpacity.current, { toValue: 1, duration: 400, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+            Animated.timing(btnTranslateY.current, { toValue: 0, duration: 400, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+          ]),
+        ]),
+      ]).start();
+    }
   }, []);
 
-  const titleAnimStyle = useAnimatedStyle(() => ({
-    opacity: titleOpacity.value,
-    transform: [{ translateY: titleTranslateY.value }],
-  }));
-
-  const subtitleAnimStyle = useAnimatedStyle(() => ({
-    opacity: subtitleOpacity.value,
-  }));
-
-  const cardAnimStyle = useAnimatedStyle(() => ({
-    opacity: cardOpacity.value,
-    transform: [{ translateY: cardTranslateY.value }],
-  }));
-
-  const btnAnimStyle = useAnimatedStyle(() => ({
-    opacity: btnOpacity.value,
-    transform: [{ translateY: btnTranslateY.value }],
-  }));
+  const titleAnimStyle = {
+    opacity: titleOpacity.current,
+    transform: [{ translateY: titleTranslateY.current }],
+  };
+  const subtitleAnimStyle = { opacity: subtitleOpacity.current };
+  const cardAnimStyle = {
+    opacity: cardOpacity.current,
+    transform: [{ translateY: cardTranslateY.current }],
+  };
+  const btnAnimStyle = {
+    opacity: btnOpacity.current,
+    transform: [{ translateY: btnTranslateY.current }],
+  };
 
   const anyPermanentlyDenied = micDenied || locationDenied;
 

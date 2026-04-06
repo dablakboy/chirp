@@ -1,0 +1,13 @@
+diff --git a/dist/metro/transformer.js b/dist/metro/transformer.js
+index 2f475cddaa2bb2d782003b9cd45fd8b1c8ad6d32..ee4c6e5ac379bd19760e155baf457364c3a9ad51 100644
+--- a/dist/metro/transformer.js
++++ b/dist/metro/transformer.js
+@@ -14,7 +14,7 @@ async function transform(config, projectRoot, filename, data, options) {
+         filename.endsWith(".css")) {
+         return transform(config, projectRoot, filename, data, options);
+     }
+-    const fakeFile = `import { injectData } from "react-native-css-interop/dist/runtime/native/styles";injectData({});`;
++    const fakeFile = `import { injectData } from "../dist/runtime/native/styles";injectData({});`;
+     const result = await transform(config, projectRoot, filename, Buffer.from(fakeFile), options);
+     const output = result.output[0];
+     const code = output.data.code.replace("({})", data.toString("utf-8"));

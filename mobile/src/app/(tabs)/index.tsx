@@ -5,36 +5,45 @@ import {
   Pressable,
   Image,
   StyleSheet,
-  Dimensions,
   Platform,
+  Animated,
+  Easing,
+  useWindowDimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import Animated, {
-  useAnimatedStyle,
-  useSharedValue,
-  withRepeat,
-  withSequence,
-  withTiming,
-  withSpring,
-  cancelAnimation,
-  Easing,
-} from 'react-native-reanimated';
 import * as Haptics from 'expo-haptics';
 import { Audio } from 'expo-av';
 import * as Location from 'expo-location';
+import * as FileSystem from 'expo-file-system';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {
-  RTCPeerConnection,
-  RTCSessionDescription,
-  RTCIceCandidate,
-  mediaDevices,
-  MediaStream,
-} from 'react-native-webrtc';
 import { usePermissions, useStateLabel } from '../../hooks/usePermissions';
 import PermissionScreen from '../../components/PermissionScreen';
 
 // suppress unused import warning — expo-location is used via usePermissions hook
 void Location;
+
+// ─── WebRTC availability detection ────────────────────────────────────────────
+// In production builds (EAS / pod install), react-native-webrtc is compiled in.
+// In sandbox / Expo Go builds the native module is absent — we fall back to
+// expo-av recording + WebSocket audio relay automatically.
+
+let RTCPeerConnectionClass: any = null;
+let RTCSessionDescriptionClass: any = null;
+let RTCIceCandidateClass: any = null;
+let mediaDevicesAPI: any = null;
+
+try {
+  const webrtc = require('react-native-webrtc');
+  if (webrtc.RTCPeerConnection && webrtc.mediaDevices) {
+    RTCPeerConnectionClass = webrtc.RTCPeerConnection;
+    RTCSessionDescriptionClass = webrtc.RTCSessionDescription;
+    RTCIceCandidateClass = webrtc.RTCIceCandidate;
+    mediaDevicesAPI = webrtc.mediaDevices;
+  }
+} catch (_) {}
+
+const WEBRTC_AVAILABLE = !!RTCPeerConnectionClass;
+console.log('[Transport] WebRTC available:', WEBRTC_AVAILABLE);
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -45,24 +54,19 @@ const WHITE = '#FFFFFF';
 const GRAY = '#888888';
 const LIGHT_GRAY = '#F0F0F0';
 
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const BTN_SIZE = Math.min(SCREEN_WIDTH * 0.72, 300);
+const STUN_ONLY: any[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
+
 
 type ButtonState = 'idle' | 'transmitting' | 'receiving';
 
 interface User {
   userId: string;
   username: string;
+  location?: string;
 }
-
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  // TURN relay fallback — required for symmetric NAT (mobile networks, corporate WiFi)
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-];
 
 // ─── Images ───────────────────────────────────────────────────────────────────
 
@@ -99,7 +103,7 @@ async function configureAudioSession() {
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
-      staysActiveInBackground: false,
+      staysActiveInBackground: true,
       playThroughEarpieceAndroid: false,
       shouldDuckAndroid: false,
     });
@@ -113,7 +117,7 @@ async function loadChirpSounds() {
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
-      staysActiveInBackground: false,
+      staysActiveInBackground: true,
       playThroughEarpieceAndroid: false,
       shouldDuckAndroid: false,
     });
@@ -153,6 +157,10 @@ async function playChirpOut() {
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 
 export default function ChirpScreen() {
+  const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = useWindowDimensions();
+  const isTablet = SCREEN_WIDTH >= 768;
+  const BTN_SIZE = Math.min(SCREEN_WIDTH * (isTablet ? 0.35 : 0.72), isTablet ? 320 : 300);
+
   const [buttonState, setButtonState] = useState<ButtonState>('idle');
   const [connectedUsers, setConnectedUsers] = useState<User[]>([]);
   const [isConnected, setIsConnected] = useState(false);
@@ -164,14 +172,23 @@ export default function ChirpScreen() {
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const buttonStateRef = useRef<ButtonState>('idle');
 
-  // WebRTC refs
-  const localStreamRef = useRef<MediaStream | null>(null);
-  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidate[]>>(new Map());
+  // WebRTC refs (used only when WEBRTC_AVAILABLE)
+  const localStreamRef = useRef<any>(null);
+  const peerConnectionsRef = useRef<Map<string, any>>(new Map());
+  const pendingCandidatesRef = useRef<Map<string, any[]>>(new Map());
+  const iceServersRef = useRef<any[]>(STUN_ONLY);
+
+  // expo-av fallback refs (used only when !WEBRTC_AVAILABLE)
+  const recordingRef = useRef<Audio.Recording | null>(null);
 
   // Inactivity tracking: replay inbound chirp if > 10s since last activity
   const lastActivityRef = useRef<number>(0);
   const inactivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Location ref to avoid re-creating WebSocket when location resolves
+  const locationRef = useRef<string | null>(null);
+  // Heartbeat interval to keep WebSocket alive through production proxies
+  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ─── Permissions ───────────────────────────────────────────────────────────
 
@@ -187,71 +204,86 @@ export default function ChirpScreen() {
 
   const stateLabel = useStateLabel(locationGranted);
 
+  // Keep locationRef in sync so connectWs can read it without being in the deps
+  useEffect(() => {
+    locationRef.current = stateLabel ?? null;
+  }, [stateLabel]);
+
   // ─── Animations ────────────────────────────────────────────────────────────
 
-  const pulseScale = useSharedValue(1);
-  const pulseOpacity = useSharedValue(0);
-  const buttonScale = useSharedValue(1);
-  const dotOpacity = useSharedValue(1);
+  const pulseScale = useRef(new Animated.Value(1));
+  const pulseOpacity = useRef(new Animated.Value(0));
+  const buttonScale = useRef(new Animated.Value(1));
+  const dotOpacity = useRef(new Animated.Value(1));
+  const dotLoopAnim = useRef<Animated.CompositeAnimation | null>(null);
+  const pulseLoopAnim = useRef<Animated.CompositeAnimation | null>(null);
+  const pulseOpacityLoopAnim = useRef<Animated.CompositeAnimation | null>(null);
 
   useEffect(() => {
-    dotOpacity.value = withRepeat(
-      withSequence(
-        withTiming(1, { duration: 800 }),
-        withTiming(0.2, { duration: 800 })
-      ),
-      -1,
-      false
+    dotLoopAnim.current = Animated.loop(
+      Animated.sequence([
+        Animated.timing(dotOpacity.current, { toValue: 1, duration: 800, easing: Easing.linear, useNativeDriver: Platform.OS !== 'web' }),
+        Animated.timing(dotOpacity.current, { toValue: 0.2, duration: 800, easing: Easing.linear, useNativeDriver: Platform.OS !== 'web' }),
+      ])
     );
+    dotLoopAnim.current.start();
+    return () => { dotLoopAnim.current?.stop(); };
   }, []);
 
   useEffect(() => {
     buttonStateRef.current = buttonState;
     if (buttonState === 'transmitting') {
-      cancelAnimation(buttonScale);
-      buttonScale.value = withTiming(1.0, { duration: 80 });
-      pulseOpacity.value = 0;
+      buttonScale.current.stopAnimation();
+      Animated.timing(buttonScale.current, { toValue: 1.0, duration: 80, useNativeDriver: Platform.OS !== 'web' }).start();
+      pulseOpacity.current.setValue(0);
+      pulseLoopAnim.current?.stop();
+      pulseOpacityLoopAnim.current?.stop();
     } else if (buttonState === 'receiving') {
-      cancelAnimation(buttonScale);
-      buttonScale.value = withSpring(1.0);
-      pulseScale.value = 1;
-      pulseOpacity.value = 0.5;
-      pulseScale.value = withRepeat(
-        withTiming(1.35, { duration: 1000, easing: Easing.out(Easing.ease) }),
-        -1,
-        false
+      buttonScale.current.stopAnimation();
+      Animated.spring(buttonScale.current, { toValue: 1.0, useNativeDriver: Platform.OS !== 'web' }).start();
+      pulseScale.current.setValue(1);
+      pulseOpacity.current.setValue(0.5);
+      pulseLoopAnim.current = Animated.loop(
+        Animated.timing(pulseScale.current, { toValue: 1.35, duration: 1000, easing: Easing.out(Easing.ease), useNativeDriver: Platform.OS !== 'web' })
       );
-      pulseOpacity.value = withRepeat(
-        withSequence(
-          withTiming(0.5, { duration: 0 }),
-          withTiming(0, { duration: 1000, easing: Easing.out(Easing.ease) })
-        ),
-        -1,
-        false
+      pulseLoopAnim.current.start();
+      pulseOpacityLoopAnim.current = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseOpacity.current, { toValue: 0.5, duration: 0, useNativeDriver: Platform.OS !== 'web' }),
+          Animated.timing(pulseOpacity.current, { toValue: 0, duration: 1000, easing: Easing.out(Easing.ease), useNativeDriver: Platform.OS !== 'web' }),
+        ])
       );
+      pulseOpacityLoopAnim.current.start();
     } else {
-      cancelAnimation(buttonScale);
-      cancelAnimation(pulseScale);
-      cancelAnimation(pulseOpacity);
-      buttonScale.value = withSpring(1.0);
-      pulseOpacity.value = withTiming(0, { duration: 200 });
+      buttonScale.current.stopAnimation();
+      pulseLoopAnim.current?.stop();
+      pulseOpacityLoopAnim.current?.stop();
+      Animated.spring(buttonScale.current, { toValue: 1.0, useNativeDriver: Platform.OS !== 'web' }).start();
+      Animated.timing(pulseOpacity.current, { toValue: 0, duration: 200, useNativeDriver: Platform.OS !== 'web' }).start();
     }
   }, [buttonState]);
 
-  const buttonAnimStyle = useAnimatedStyle(() => ({
-    transform: [{ scale: buttonScale.value }],
-  }));
-
-  const pulseAnimStyle = useAnimatedStyle(() => ({
-    transform: [{ scale: pulseScale.value }],
-    opacity: pulseOpacity.value,
-  }));
-
-  const dotAnimStyle = useAnimatedStyle(() => ({
-    opacity: dotOpacity.value,
-  }));
+  const buttonAnimStyle = { transform: [{ scale: buttonScale.current }] };
+  const pulseAnimStyle = { transform: [{ scale: pulseScale.current }], opacity: pulseOpacity.current };
+  const dotAnimStyle = { opacity: dotOpacity.current };
 
   // ─── Init user identity ───────────────────────────────────────────────────
+
+  const fetchIceServers = useCallback(async () => {
+    try {
+      const baseUrl = process.env.EXPO_PUBLIC_BACKEND_URL!;
+      const res = await fetch(`${baseUrl}/api/turn-credentials`);
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.data) && json.data.length > 0) {
+          iceServersRef.current = json.data;
+          console.log('[WebRTC] ICE servers loaded from backend:', json.data.length);
+        }
+      }
+    } catch (e) {
+      console.log('[WebRTC] Could not fetch ICE servers, using STUN only:', e);
+    }
+  }, []);
 
   useEffect(() => {
     async function initUser() {
@@ -271,14 +303,15 @@ export default function ChirpScreen() {
     initUser();
     configureAudioSession();
     loadChirpSounds();
-  }, []);
+    if (WEBRTC_AVAILABLE) fetchIceServers();
+  }, [fetchIceServers]);
 
-  // ─── WebRTC helpers ───────────────────────────────────────────────────────
+  // ─── WebRTC helpers (production builds only) ──────────────────────────────
 
   const initLocalStream = useCallback(async () => {
-    if (localStreamRef.current) return;
+    if (!WEBRTC_AVAILABLE || localStreamRef.current) return;
     try {
-      const stream = await mediaDevices.getUserMedia({
+      const stream = await mediaDevicesAPI.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
@@ -287,9 +320,8 @@ export default function ChirpScreen() {
           sampleRate: 16000,
         } as any,
         video: false,
-      }) as MediaStream;
-      // Start muted — PTT enables the track
-      stream.getAudioTracks().forEach((t) => { t.enabled = false; });
+      });
+      stream.getAudioTracks().forEach((t: any) => { t.enabled = false; });
       localStreamRef.current = stream;
       console.log('[WebRTC] Local stream ready');
     } catch (e) {
@@ -297,14 +329,14 @@ export default function ChirpScreen() {
     }
   }, []);
 
-  const createPeerConnection = useCallback((remoteUserId: string): RTCPeerConnection => {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, iceCandidatePoolSize: 10 });
+  const createPeerConnection = useCallback((remoteUserId: string): any => {
+    const pc = new RTCPeerConnectionClass({ iceServers: iceServersRef.current, iceCandidatePoolSize: 10 });
 
-    localStreamRef.current?.getTracks().forEach((track) => {
-      pc.addTrack(track, localStreamRef.current!);
+    localStreamRef.current?.getTracks().forEach((track: any) => {
+      pc.addTrack(track, localStreamRef.current);
     });
 
-    (pc as any).addEventListener('icecandidate', (event: any) => {
+    pc.addEventListener('icecandidate', (event: any) => {
       if (event.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({
           type: 'webrtc-ice-candidate',
@@ -314,26 +346,27 @@ export default function ChirpScreen() {
       }
     });
 
-    (pc as any).addEventListener('track', (event: any) => {
+    pc.addEventListener('track', (_event: any) => {
       console.log('[WebRTC] Remote track received from', remoteUserId);
-      try {
-        Audio.setAudioModeAsync({
-          allowsRecordingIOS: true,
-          playsInSilentModeIOS: true,
-          staysActiveInBackground: false,
-          playThroughEarpieceAndroid: false,
-          shouldDuckAndroid: false,
-        });
-      } catch (e) {
-        console.log('[Audio] Could not re-assert audio session on track:', e);
-      }
     });
 
-    (pc as any).addEventListener('connectionstatechange', () => {
+    pc.addEventListener('connectionstatechange', () => {
       const state = pc.connectionState;
       console.log('[WebRTC] Connection state with', remoteUserId, ':', state);
+      if (state === 'connected') {
+        const senders: any[] = pc.getSenders?.() ?? [];
+        for (const sender of senders) {
+          if (sender?.track?.kind === 'audio') {
+            const params = sender.getParameters?.();
+            if (params && Array.isArray(params.encodings) && params.encodings.length > 0) {
+              params.encodings[0].maxBitrate = 32000;
+              params.encodings[0].minBitrate = 16000;
+              sender.setParameters?.(params).catch(() => {});
+            }
+          }
+        }
+      }
       if (state === 'failed') {
-        console.log('[WebRTC] Peer connection failed — closing and cleaning up');
         pc.close();
         peerConnectionsRef.current.delete(remoteUserId);
         pendingCandidatesRef.current.delete(remoteUserId);
@@ -360,7 +393,8 @@ export default function ChirpScreen() {
     const base = (process.env.EXPO_PUBLIC_BACKEND_URL ?? '')
       .replace('https://', 'wss://')
       .replace('http://', 'ws://');
-    const url = `${base}/ws?userId=${encodeURIComponent(myUserId)}&username=${encodeURIComponent(myUsername)}`;
+    const locationParam = locationRef.current ? `&location=${encodeURIComponent(locationRef.current)}` : '';
+    const url = `${base}/ws?userId=${encodeURIComponent(myUserId)}&username=${encodeURIComponent(myUsername)}${locationParam}`;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
@@ -368,13 +402,30 @@ export default function ChirpScreen() {
     ws.onopen = async () => {
       setIsConnected(true);
       console.log('[WS] Connected');
-      await initLocalStream();
+      // Send location immediately if already resolved
+      if (locationRef.current) {
+        try { ws.send(JSON.stringify({ type: 'updateLocation', location: locationRef.current })); } catch (_) {}
+      }
+      if (WEBRTC_AVAILABLE) await initLocalStream();
+      // Heartbeat: ping every 25s to keep connection alive through Railway/production proxies
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) {}
+        }
+      }, 25000);
     };
 
     ws.onclose = () => {
       setIsConnected(false);
+      if (pingIntervalRef.current) {
+        clearInterval(pingIntervalRef.current);
+        pingIntervalRef.current = null;
+      }
       console.log('[WS] Disconnected. Reconnecting in 3s...');
-      reconnectTimeoutRef.current = setTimeout(() => connectWs(), 3000);
+      reconnectTimeoutRef.current = setTimeout(() => {
+        if (wsRef.current === ws) connectWs();
+      }, 3000);
     };
 
     ws.onerror = (e) => {
@@ -386,30 +437,41 @@ export default function ChirpScreen() {
         const msg = JSON.parse(event.data as string) as any;
 
         if (msg.type === 'userList') {
-          setConnectedUsers(msg.users ?? []);
+          setConnectedUsers((msg.users ?? []).map((u: any) => ({
+            userId: u.userId,
+            username: u.username,
+            location: u.location,
+          })));
         } else if (msg.type === 'userJoined') {
           setConnectedUsers((prev) => {
             if (prev.find((u) => u.userId === msg.userId)) return prev;
-            return [...prev, { userId: msg.userId ?? '', username: msg.username ?? '' }];
+            return [...prev, { userId: msg.userId ?? '', username: msg.username ?? '', location: msg.location }];
           });
-          await initLocalStream();
-          const pc = createPeerConnection(msg.userId);
-          const offer = await pc.createOffer({});
-          await pc.setLocalDescription(offer);
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({
-              type: 'webrtc-offer',
-              toUserId: msg.userId,
-              sdp: pc.localDescription,
-            }));
+          if (WEBRTC_AVAILABLE) {
+            await initLocalStream();
+            await fetchIceServers();
+            const pc = createPeerConnection(msg.userId);
+            const offer = await pc.createOffer({});
+            await pc.setLocalDescription(offer);
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({
+                type: 'webrtc-offer',
+                toUserId: msg.userId,
+                sdp: pc.localDescription,
+              }));
+            }
           }
         } else if (msg.type === 'userLeft') {
           setConnectedUsers((prev) => prev.filter((u) => u.userId !== msg.userId));
-          closePeerConnection(msg.userId);
+          if (WEBRTC_AVAILABLE) closePeerConnection(msg.userId);
           if (buttonStateRef.current === 'receiving') {
             setButtonState('idle');
             setTalkingUser(null);
           }
+        } else if (msg.type === 'locationUpdate') {
+          setConnectedUsers((prev) => prev.map((u) =>
+            u.userId === msg.userId ? { ...u, location: msg.location } : u
+          ));
         } else if (msg.type === 'startTalk') {
           if (buttonStateRef.current !== 'transmitting') {
             setButtonState('receiving');
@@ -430,47 +492,77 @@ export default function ChirpScreen() {
             setButtonState('idle');
             setTalkingUser(null);
           }
-        } else if (msg.type === 'webrtc-offer') {
-          await initLocalStream();
-          let pc = peerConnectionsRef.current.get(msg.fromUserId);
-          if (!pc) pc = createPeerConnection(msg.fromUserId);
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          const pending = pendingCandidatesRef.current.get(msg.fromUserId) ?? [];
-          for (const c of pending) await pc.addIceCandidate(c);
-          pendingCandidatesRef.current.delete(msg.fromUserId);
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({
-              type: 'webrtc-answer',
-              toUserId: msg.fromUserId,
-              sdp: pc.localDescription,
-            }));
+        } else if (msg.type === 'audio' && !WEBRTC_AVAILABLE) {
+          // expo-av fallback: play received audio blob
+          try {
+            const tempUri = `${FileSystem.cacheDirectory}recv_${Date.now()}.m4a`;
+            await FileSystem.writeAsStringAsync(tempUri, msg.data, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+            await Audio.setAudioModeAsync({
+              allowsRecordingIOS: false,
+              playsInSilentModeIOS: true,
+              staysActiveInBackground: true,
+              playThroughEarpieceAndroid: false,
+            });
+            const { sound } = await Audio.Sound.createAsync(
+              { uri: tempUri },
+              { shouldPlay: true, volume: 1.0 }
+            );
+            sound.setOnPlaybackStatusUpdate((status: any) => {
+              if (status.isLoaded && status.didJustFinish) {
+                sound.unloadAsync().catch(() => {});
+                FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => {});
+              }
+            });
+          } catch (e) {
+            console.log('[Audio] Playback error:', e);
           }
-        } else if (msg.type === 'webrtc-answer') {
-          const pc = peerConnectionsRef.current.get(msg.fromUserId);
-          if (pc) {
-            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        } else if (WEBRTC_AVAILABLE) {
+          // WebRTC signaling messages
+          if (msg.type === 'webrtc-offer') {
+            await initLocalStream();
+            await fetchIceServers();
+            let pc = peerConnectionsRef.current.get(msg.fromUserId);
+            if (!pc) pc = createPeerConnection(msg.fromUserId);
+            await pc.setRemoteDescription(new RTCSessionDescriptionClass(msg.sdp));
             const pending = pendingCandidatesRef.current.get(msg.fromUserId) ?? [];
             for (const c of pending) await pc.addIceCandidate(c);
             pendingCandidatesRef.current.delete(msg.fromUserId);
-          }
-        } else if (msg.type === 'webrtc-ice-candidate') {
-          const pc = peerConnectionsRef.current.get(msg.fromUserId);
-          const candidate = new RTCIceCandidate(msg.candidate);
-          if (pc && pc.remoteDescription) {
-            await pc.addIceCandidate(candidate);
-          } else {
-            const arr = pendingCandidatesRef.current.get(msg.fromUserId) ?? [];
-            arr.push(candidate);
-            pendingCandidatesRef.current.set(msg.fromUserId, arr);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({
+                type: 'webrtc-answer',
+                toUserId: msg.fromUserId,
+                sdp: pc.localDescription,
+              }));
+            }
+          } else if (msg.type === 'webrtc-answer') {
+            const pc = peerConnectionsRef.current.get(msg.fromUserId);
+            if (pc) {
+              await pc.setRemoteDescription(new RTCSessionDescriptionClass(msg.sdp));
+              const pending = pendingCandidatesRef.current.get(msg.fromUserId) ?? [];
+              for (const c of pending) await pc.addIceCandidate(c);
+              pendingCandidatesRef.current.delete(msg.fromUserId);
+            }
+          } else if (msg.type === 'webrtc-ice-candidate') {
+            const pc = peerConnectionsRef.current.get(msg.fromUserId);
+            const candidate = new RTCIceCandidateClass(msg.candidate);
+            if (pc && pc.remoteDescription) {
+              await pc.addIceCandidate(candidate);
+            } else {
+              const arr = pendingCandidatesRef.current.get(msg.fromUserId) ?? [];
+              arr.push(candidate);
+              pendingCandidatesRef.current.set(msg.fromUserId, arr);
+            }
           }
         }
       } catch (e) {
         console.log('[WS] Message error:', e);
       }
     };
-  }, [myUserId, myUsername, createPeerConnection, closePeerConnection, initLocalStream]);
+  }, [myUserId, myUsername, createPeerConnection, closePeerConnection, initLocalStream, fetchIceServers]);
 
   // Only connect WebSocket once mic is granted
   useEffect(() => {
@@ -480,17 +572,36 @@ export default function ChirpScreen() {
     return () => {
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
       if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
-      peerConnectionsRef.current.forEach((pc) => pc.close());
-      peerConnectionsRef.current.clear();
-      localStreamRef.current?.getTracks().forEach((t) => t.stop());
-      localStreamRef.current = null;
-      wsRef.current?.close();
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      if (WEBRTC_AVAILABLE) {
+        peerConnectionsRef.current.forEach((pc) => pc.close());
+        peerConnectionsRef.current.clear();
+        localStreamRef.current?.getTracks().forEach((t: any) => t.stop());
+        localStreamRef.current = null;
+      } else {
+        recordingRef.current?.stopAndUnloadAsync().catch(() => {});
+        recordingRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.onclose = null; // prevent stale reconnect from firing
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, [myUserId, myUsername, micGranted, connectWs]);
 
+  // Send location update over WS when stateLabel resolves (without reconnecting)
+  useEffect(() => {
+    if (!stateLabel) return;
+    locationRef.current = stateLabel;
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'updateLocation', location: stateLabel }));
+    }
+  }, [stateLabel]);
+
   // ─── Push-to-talk ─────────────────────────────────────────────────────────
 
-  const handlePressIn = () => {
+  const handlePressIn = async () => {
     if (!micGranted) return;
     if (buttonStateRef.current === 'receiving') return;
 
@@ -498,23 +609,73 @@ export default function ChirpScreen() {
     setButtonState('transmitting');
     playChirpOut();
 
-    localStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = true; });
-
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'startTalk', userId: myUserId }));
     }
+
+    if (WEBRTC_AVAILABLE) {
+      // WebRTC: unmute the already-established local stream track
+      localStreamRef.current?.getAudioTracks().forEach((t: any) => { t.enabled = true; });
+    } else {
+      // Fallback: start recording
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+          staysActiveInBackground: true,
+          playThroughEarpieceAndroid: false,
+        });
+        const { recording } = await Audio.Recording.createAsync(
+          Audio.RecordingOptionsPresets.HIGH_QUALITY
+        );
+        recordingRef.current = recording;
+      } catch (e) {
+        console.log('[Audio] Recording start error:', e);
+      }
+    }
   };
 
-  const handlePressOut = () => {
+  const handlePressOut = async () => {
     if (buttonStateRef.current !== 'transmitting') return;
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     setButtonState('idle');
 
-    localStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = false; });
-
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'stopTalk', userId: myUserId }));
+    }
+
+    if (WEBRTC_AVAILABLE) {
+      // WebRTC: mute the track — peer connections keep audio flowing silently
+      localStreamRef.current?.getAudioTracks().forEach((t: any) => { t.enabled = false; });
+    } else {
+      // Fallback: stop recording and send audio over WebSocket
+      const recording = recordingRef.current;
+      recordingRef.current = null;
+      if (!recording) return;
+      try {
+        await recording.stopAndUnloadAsync();
+        const uri = recording.getURI();
+        if (uri) {
+          const base64 = await FileSystem.readAsStringAsync(uri, {
+            encoding: FileSystem.EncodingType.Base64,
+          });
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({ type: 'audio', data: base64, username: myUsername })
+            );
+          }
+          await FileSystem.deleteAsync(uri, { idempotent: true });
+        }
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: false,
+          playsInSilentModeIOS: true,
+          staysActiveInBackground: true,
+          playThroughEarpieceAndroid: false,
+        });
+      } catch (e) {
+        console.log('[Audio] Recording stop/send error:', e);
+      }
     }
   };
 
@@ -552,6 +713,89 @@ export default function ChirpScreen() {
     return GRAY;
   };
 
+  if (isTablet) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={tabletStyles.layout}>
+          {/* Left: button area */}
+          <View style={tabletStyles.leftPanel}>
+            <Animated.View style={[
+              tabletStyles.rippleRing,
+              pulseAnimStyle,
+              { width: BTN_SIZE + 80, height: BTN_SIZE + 80 }
+            ]} />
+            <Pressable
+              onPressIn={handlePressIn}
+              onPressOut={handlePressOut}
+              testID="ptt-button"
+              style={[styles.buttonContainer, !micGranted && styles.buttonContainerDisabled]}
+              disabled={!micGranted}
+            >
+              <Animated.View style={[styles.buttonWrapper, buttonAnimStyle]}>
+                <Image source={IMAGES[buttonState]} style={{ width: BTN_SIZE, height: BTN_SIZE }} resizeMode="contain" />
+              </Animated.View>
+            </Pressable>
+            <Text style={[tabletStyles.statusText, { color: getStatusColor() }]}>{getStatusText()}</Text>
+          </View>
+
+          {/* Vertical divider */}
+          <View style={tabletStyles.verticalDivider} />
+
+          {/* Right: info panel */}
+          <View style={tabletStyles.rightPanel}>
+            {/* App header (title + badges) */}
+            <View style={tabletStyles.rightHeader}>
+              <View style={styles.channelBadge}>
+                <Animated.View style={[styles.dot, dotAnimStyle, { backgroundColor: isConnected ? '#22c55e' : '#ef4444' }]} />
+                <Text style={tabletStyles.channelText}>CH 1</Text>
+              </View>
+              <View style={styles.titleArea}>
+                <Text style={tabletStyles.appTitle}>CHIRP</Text>
+                {stateLabel ? <View style={styles.stateBadge}><Text style={styles.stateBadgeText}>{stateLabel}</Text></View> : null}
+              </View>
+              <View style={styles.userBadge}>
+                <Text style={styles.userBadgeText}>{totalOnline} ONLINE</Text>
+              </View>
+            </View>
+            <View style={styles.headerDivider} />
+
+            {/* Users section fills remaining space */}
+            <View style={tabletStyles.rightContent}>
+              <Text style={tabletStyles.usersSectionTitle}>ON AIR</Text>
+              <View style={tabletStyles.usersGrid}>
+                {otherUsers.length === 0 ? (
+                  <Text style={styles.noUsersText}>No other units online</Text>
+                ) : (
+                  otherUsers.slice(0, 12).map((user) => (
+                    <View key={user.userId} style={[tabletStyles.userPill, talkingUser === user.username && styles.userPillActive]}>
+                      <View style={[styles.userDot, { backgroundColor: talkingUser === user.username ? YELLOW : '#22c55e' }]} />
+                      <Text style={[tabletStyles.userPillText, talkingUser === user.username && styles.userPillTextActive]}>
+                        {user.location ? `${user.username} (${user.location})` : user.username}
+                      </Text>
+                    </View>
+                  ))
+                )}
+              </View>
+            </View>
+
+            {/* My call sign at bottom */}
+            {myUsername ? (
+              <View style={[styles.myCallSign, { paddingHorizontal: 28, paddingBottom: 24 }]}>
+                <View style={styles.myCallSignTextGroup}>
+                  <View style={styles.myCallSignRow}>
+                    <Text style={styles.myCallSignLabel}>YOUR CALL SIGN: </Text>
+                    <Text style={styles.myCallSignValue}>{myUsername}</Text>
+                  </View>
+                  {stateLabel ? <Text style={styles.myCallSignLocation}>{stateLabel}</Text> : null}
+                </View>
+              </View>
+            ) : null}
+          </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       {/* Header */}
@@ -582,7 +826,7 @@ export default function ChirpScreen() {
 
       {/* Button area */}
       <View style={styles.buttonArea}>
-        <Animated.View style={[styles.rippleRing, pulseAnimStyle]} />
+        <Animated.View style={[styles.rippleRing, pulseAnimStyle, { width: BTN_SIZE + 60, height: BTN_SIZE + 60 }]} />
 
         <Pressable
           onPressIn={handlePressIn}
@@ -591,10 +835,10 @@ export default function ChirpScreen() {
           style={[styles.buttonContainer, !micGranted && styles.buttonContainerDisabled]}
           disabled={!micGranted}
         >
-          <Animated.View style={[styles.buttonWrapper, buttonAnimStyle]}>
+          <Animated.View style={[styles.buttonWrapper, buttonAnimStyle, { width: BTN_SIZE, height: BTN_SIZE }]}>
             <Image
               source={IMAGES[buttonState]}
-              style={[styles.buttonImage, !micGranted && styles.buttonImageDisabled]}
+              style={[styles.buttonImage, { width: BTN_SIZE, height: BTN_SIZE }, !micGranted && styles.buttonImageDisabled]}
               resizeMode="contain"
             />
           </Animated.View>
@@ -632,7 +876,7 @@ export default function ChirpScreen() {
                     talkingUser === user.username && styles.userPillTextActive,
                   ]}
                 >
-                  {user.username}
+                  {user.location ? `${user.username} (${user.location})` : user.username}
                 </Text>
               </View>
             ))
@@ -640,8 +884,15 @@ export default function ChirpScreen() {
         </View>
         {myUsername ? (
           <View style={styles.myCallSign}>
-            <Text style={styles.myCallSignLabel}>YOUR CALL SIGN: </Text>
-            <Text style={styles.myCallSignValue}>{myUsername}</Text>
+            <View style={styles.myCallSignTextGroup}>
+              <View style={styles.myCallSignRow}>
+                <Text style={styles.myCallSignLabel}>YOUR CALL SIGN: </Text>
+                <Text style={styles.myCallSignValue}>{myUsername}</Text>
+              </View>
+              {stateLabel ? (
+                <Text style={styles.myCallSignLocation}>{stateLabel}</Text>
+              ) : null}
+            </View>
           </View>
         ) : null}
       </View>
@@ -729,10 +980,8 @@ const styles = StyleSheet.create({
   },
   rippleRing: {
     position: 'absolute',
-    width: BTN_SIZE + 60,
-    height: BTN_SIZE + 60,
-    borderRadius: (BTN_SIZE + 60) / 2,
     borderWidth: 3,
+    borderRadius: 9999,
     borderColor: BURGUNDY,
   },
   buttonContainer: {
@@ -743,15 +992,10 @@ const styles = StyleSheet.create({
     opacity: 0.35,
   },
   buttonWrapper: {
-    width: BTN_SIZE,
-    height: BTN_SIZE,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  buttonImage: {
-    width: BTN_SIZE,
-    height: BTN_SIZE,
-  },
+  buttonImage: {},
   buttonImageDisabled: {
     tintColor: GRAY,
   },
@@ -821,7 +1065,22 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     borderTopWidth: 1,
     borderTopColor: LIGHT_GRAY,
+    alignItems: 'flex-start',
+  },
+  myCallSignTextGroup: {
+    flexDirection: 'column',
+    gap: 2,
+  },
+  myCallSignRow: {
+    flexDirection: 'row',
     alignItems: 'center',
+  },
+  myCallSignLocation: {
+    fontSize: 9,
+    color: GRAY,
+    fontWeight: '600',
+    letterSpacing: 2,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   myCallSignLabel: {
     fontSize: 10,
@@ -834,6 +1093,100 @@ const styles = StyleSheet.create({
     color: BURGUNDY,
     fontWeight: '800',
     letterSpacing: 2,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+});
+
+const tabletStyles = StyleSheet.create({
+  layout: {
+    flex: 1,
+    flexDirection: 'row',
+  },
+  leftPanel: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: WHITE,
+  },
+  rippleRing: {
+    position: 'absolute',
+    borderRadius: 9999,
+    borderWidth: 3,
+    borderColor: BURGUNDY,
+  },
+  verticalDivider: {
+    width: 2,
+    backgroundColor: BURGUNDY,
+    opacity: 0.6,
+    marginVertical: 20,
+  },
+  rightPanel: {
+    width: 340,
+    backgroundColor: WHITE,
+    flexDirection: 'column',
+  },
+  rightHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 28,
+    paddingVertical: 16,
+  },
+  rightContent: {
+    flex: 1,
+    paddingHorizontal: 28,
+    paddingTop: 20,
+  },
+  appTitle: {
+    fontSize: 42,
+    fontWeight: '900',
+    color: BLACK,
+    letterSpacing: 10,
+    fontFamily: Platform.OS === 'ios' ? 'Helvetica Neue' : 'sans-serif-condensed',
+  },
+  channelText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: BURGUNDY,
+    letterSpacing: 2,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  statusText: {
+    marginTop: 32,
+    fontSize: 14,
+    fontWeight: '700',
+    letterSpacing: 4,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  usersSectionTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: BURGUNDY,
+    letterSpacing: 3,
+    marginBottom: 14,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  usersGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  userPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: LIGHT_GRAY,
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  userPillText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: BLACK,
+    letterSpacing: 1,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
 });

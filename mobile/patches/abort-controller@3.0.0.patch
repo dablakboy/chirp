@@ -1,0 +1,29 @@
+diff --git a/node_modules/abort-controller/.bun-tag-c06d01b79a3333b0 b/.bun-tag-c06d01b79a3333b0
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/abort-controller.mjs b/dist/abort-controller.mjs
+index 88ba22d5574edc4254de5b2deca5af6d842261ea..a0a47962d6bd89821717ead8afe14038092bd29a 100644
+--- a/dist/abort-controller.mjs
++++ b/dist/abort-controller.mjs
+@@ -2,7 +2,7 @@
+  * @author Toru Nagashima <https://github.com/mysticatea>
+  * See LICENSE file in root directory for full license.
+  */
+-import { EventTarget, defineEventAttribute } from 'event-target-shim';
++import { EventTarget, defineEventAttribute } from '../../event-target-shim/dist/event-target-shim.mjs';
+ 
+ /**
+  * The signal class.
+diff --git a/package.json b/package.json
+index fc705e03f3539a0d28406d4e3184a72f2fc370e9..d34ca488d4936ff8f54ab7d0315085c4170a7477 100644
+--- a/package.json
++++ b/package.json
+@@ -2,7 +2,7 @@
+   "name": "abort-controller",
+   "version": "3.0.0",
+   "description": "An implementation of WHATWG AbortController interface.",
+-  "main": "dist/abort-controller",
++  "main": "dist/abort-controller.js",
+   "files": [
+     "dist",
+     "polyfill.*",

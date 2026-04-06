@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { Audio } from 'expo-av';
 import * as Location from 'expo-location';
 
-export type StateLabel = 'NJ' | 'PA' | 'NY' | null;
+export type StateLabel = string | null;
 
 interface PermissionsState {
   micGranted: boolean;
@@ -59,22 +59,6 @@ export function usePermissions(): UsePermissionsReturn {
   };
 }
 
-function getStateLabel(lat: number, lon: number): StateLabel {
-  // NJ: lat 38.9-41.4, lon -75.6 to -73.9
-  if (lat >= 38.9 && lat <= 41.4 && lon >= -75.6 && lon <= -73.9) {
-    return 'NJ';
-  }
-  // PA: lat 39.7-42.5, lon -80.5 to -74.7
-  if (lat >= 39.7 && lat <= 42.5 && lon >= -80.5 && lon <= -74.7) {
-    return 'PA';
-  }
-  // NY: lat 40.5-45.0, lon -79.8 to -71.9
-  if (lat >= 40.5 && lat <= 45.0 && lon >= -79.8 && lon <= -71.9) {
-    return 'NY';
-  }
-  return null;
-}
-
 export function useStateLabel(locationGranted: boolean): StateLabel {
   const [label, setLabel] = useState<StateLabel>(null);
 
@@ -91,8 +75,20 @@ export function useStateLabel(locationGranted: boolean): StateLabel {
         const pos = await Location.getCurrentPositionAsync({
           accuracy: Location.Accuracy.Lowest,
         });
-        if (!cancelled) {
-          setLabel(getStateLabel(pos.coords.latitude, pos.coords.longitude));
+        if (cancelled) return;
+
+        const results = await Location.reverseGeocodeAsync({
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+        });
+
+        if (cancelled) return;
+
+        const region = results?.[0]?.region ?? results?.[0]?.subregion ?? null;
+        if (region) {
+          // expo-location returns the full state name on some platforms — abbreviate it
+          const abbrev = US_STATE_ABBREVS[region.toUpperCase()] ?? (region.length <= 3 ? region.toUpperCase() : null);
+          setLabel((abbrev as StateLabel) ?? null);
         }
       } catch (e) {
         console.log('[useStateLabel] Location error:', e);
@@ -108,3 +104,18 @@ export function useStateLabel(locationGranted: boolean): StateLabel {
 
   return label;
 }
+
+const US_STATE_ABBREVS: Record<string, string> = {
+  ALABAMA: 'AL', ALASKA: 'AK', ARIZONA: 'AZ', ARKANSAS: 'AR', CALIFORNIA: 'CA',
+  COLORADO: 'CO', CONNECTICUT: 'CT', DELAWARE: 'DE', FLORIDA: 'FL', GEORGIA: 'GA',
+  HAWAII: 'HI', IDAHO: 'ID', ILLINOIS: 'IL', INDIANA: 'IN', IOWA: 'IA',
+  KANSAS: 'KS', KENTUCKY: 'KY', LOUISIANA: 'LA', MAINE: 'ME', MARYLAND: 'MD',
+  MASSACHUSETTS: 'MA', MICHIGAN: 'MI', MINNESOTA: 'MN', MISSISSIPPI: 'MS',
+  MISSOURI: 'MO', MONTANA: 'MT', NEBRASKA: 'NE', NEVADA: 'NV',
+  'NEW HAMPSHIRE': 'NH', 'NEW JERSEY': 'NJ', 'NEW MEXICO': 'NM', 'NEW YORK': 'NY',
+  'NORTH CAROLINA': 'NC', 'NORTH DAKOTA': 'ND', OHIO: 'OH', OKLAHOMA: 'OK',
+  OREGON: 'OR', PENNSYLVANIA: 'PA', 'RHODE ISLAND': 'RI', 'SOUTH CAROLINA': 'SC',
+  'SOUTH DAKOTA': 'SD', TENNESSEE: 'TN', TEXAS: 'TX', UTAH: 'UT', VERMONT: 'VT',
+  VIRGINIA: 'VA', WASHINGTON: 'WA', 'WEST VIRGINIA': 'WV', WISCONSIN: 'WI',
+  WYOMING: 'WY', 'DISTRICT OF COLUMBIA': 'DC',
+};
